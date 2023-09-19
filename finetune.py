@@ -4,12 +4,57 @@ import torch
 import os
 from datasets import load_dataset, load_from_disk, DatasetDict
 from datetime import timedelta
+import numpy as np
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, set_seed, DummyOptim, DummyScheduler
 from tqdm import tqdm
 from transformers import set_seed, default_data_collator, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+from transformers import set_seed
+
+
+
+def torch_custom_data_collator(features):
+    for feature in features:
+        feature['labels'] = [id for id in feature['input_ids']]
+        # Mask out inputs
+        k = feature.pop('k')
+        n = len(feature['input_ids'])
+        assert k < n
+        feature['labels'][:k] = [-100 for _ in range(k)]
+        feature['attention_mask'] = [1.0 for _ in range(n)]
+
+    first = features[0]
+    assert first['objective'] in {'unlikelihood', 'likelihood'}
+    batch = {'objective': first['objective']}
+
+    # Special handling for labels.
+    # Ensure that tensor is created with the correct type
+    # (it should be automatically the case, but let's make sure of it.)
+    if "label" in first and first["label"] is not None:
+        label = first["label"].item() if isinstance(first["label"], torch.Tensor) else first["label"]
+        dtype = torch.long if isinstance(label, int) else torch.float
+        batch["labels"] = torch.tensor([f["label"] for f in features], dtype=dtype)
+    elif "label_ids" in first and first["label_ids"] is not None:
+        if isinstance(first["label_ids"], torch.Tensor):
+            batch["labels"] = torch.stack([f["label_ids"] for f in features])
+        else:
+            dtype = torch.long if type(first["label_ids"][0]) is int else torch.float
+            batch["labels"] = torch.tensor([f["label_ids"] for f in features], dtype=dtype)
+
+    # Handling of all other possible keys.
+    # Again, we will use the first element to figure out which key/values are not None for this model.
+    for k, v in first.items():
+        if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
+            if isinstance(v, torch.Tensor):
+                batch[k] = torch.stack([f[k] for f in features])
+            elif isinstance(v, np.ndarray):
+                batch[k] = torch.tensor(np.stack([f[k] for f in features]))
+            else:
+                batch[k] = torch.tensor([f[k] for f in features])
+
+    return batch
 
 
 def find_all_linear_names(model):
@@ -26,6 +71,7 @@ def find_all_linear_names(model):
 
 
 def main(args):
+    os.environ['WANDB_NAME'] = f'guidance-{args.guidance}'
 
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -85,41 +131,21 @@ def main(args):
         use_flash_attention_2=True
     )
 
-    try:
-        train_dataset = load_dataset(args.dataset)
-    except:
-        train_dataset = load_from_disk(args.dataset)
-    if isinstance(train_dataset, DatasetDict):
-        train_dataset = train_dataset["train"]
+    accelerator.print(model.config)
 
-    if "input_ids" not in train_dataset.column_names:
-        raise RuntimeError("Dataset must include an `input_ids` feature")
-    if "labels" not in train_dataset.column_names:
-        def add_labels(sample):
-            sample["labels"] = copy.deepcopy(sample["input_ids"])
-            return sample
-        train_dataset = train_dataset.map(
-            add_labels, desc="Adding labels", num_proc=args.num_proc)
-    if "attention_mask" not in train_dataset.column_names:
-        def add_attention_mask(sample):
-            sample["attention_mask"] = torch.ones(
-                len(sample["input_ids"]), dtype=torch.int8)
-            return sample
-        train_dataset = train_dataset.map(
-            add_attention_mask, desc="Adding attention mask", num_proc=args.num_proc)
-
-    if args.truncate:
-        def truncate(sample):
-            sample["input_ids"] = sample["input_ids"][0:args.truncate]
-            sample["labels"] = sample["labels"][0:args.truncate]
-            sample["attention_mask"] = sample["attention_mask"][0:args.truncate]
-            return sample
-        train_dataset = train_dataset.map(
-            truncate, desc="Truncating", num_proc=args.num_proc)
-
+    # train_dataset = load_dataset(args.dataset, split='train')
+    in_dir = '/nlp/projects/summarization/bhc_data_cleanup'
+    K = 8192
+    suffix = '' if args.guidance == 'none' else f'_{args.guidance}'
+    data_dir = os.path.join(in_dir, f'summarization_filter_{K}_tokens{suffix}_llama')
+    train_dataset = load_from_disk(data_dir)['train']
+    keep_cols = {'input_ids', 'attention_mask', 'labels', 'k', 'objective'}
+    remove_cols = [col for col in train_dataset.column_names if col not in keep_cols]
+    train_dataset = train_dataset.remove_columns(remove_cols)
+    
     train_loader = DataLoader(
         train_dataset,
-        collate_fn=default_data_collator,
+        collate_fn=torch_custom_data_collator,
         shuffle=True,
         batch_size=args.batch_size
     )
@@ -128,8 +154,10 @@ def main(args):
         from peft import get_peft_model, LoraConfig, TaskType
         target_modules = find_all_linear_names(model)
         accelerator.print(f"LoRA target modules: {target_modules}")
-        peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False,
-                                 r=16, lora_alpha=64, lora_dropout=0.05, target_modules=target_modules)
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM, inference_mode=False,
+            r=16, lora_alpha=64, lora_dropout=0.05, target_modules=target_modules
+        )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
 
@@ -179,6 +207,8 @@ def main(args):
             int(training_difference.replace("step_", ""))
         )
 
+        accelerator.print(model.config)
+
     if args.resume_from_checkpoint and resume_step is not None:
         train_loader = accelerator.skip_first_batches(
             train_loader, resume_step)
@@ -199,7 +229,8 @@ def main(args):
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    loss_log = {"loss": loss.item()}
+                    objective = batch['objective']
+                    loss_log = {objective: loss.item()}
                     accelerator.log(loss_log, step=completed_steps)
                     if isinstance(args.grad_norm, float):
                         accelerator.clip_grad_norm_(
@@ -272,6 +303,13 @@ if __name__ == "__main__":
     args.add_argument("--scaling-type", type=str, default="yarn")
     args.add_argument("--rope-theta", type=float, default=10000.0)
     args.add_argument("--truncate", type=int)
+    args.add_argument(
+        "--guidance", default="none",
+        choices=[
+            "none", "decorate", "frost", "frost_plan", "clique", "clique_unlike", "clique_frost", "sent_frost",
+            "sent_frost_unlike"
+        ]
+    )
     args.add_argument("--dataset", type=str,
                       default="emozilla/pg_books-tokenized-bos-eos-chunked-65536")
     args.add_argument("--deepspeed", action="store_true")
