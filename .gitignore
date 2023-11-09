@@ -9,4 +9,4 @@ wandb/
 lm_cache/
 run.sh
 .idea/
-.idea/workspace.xml
+.idea

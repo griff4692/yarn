@@ -37,7 +37,7 @@
     <property name="last_opened_file_path" value="$PROJECT_DIR$" />
     <property name="node.js.detected.package.eslint" value="true" />
     <property name="node.js.selected.package.eslint" value="(autodetect)" />
-    <property name="settings.editor.selected.configurable" value="com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable" />
+    <property name="settings.editor.selected.configurable" value="com.jetbrains.python.configuration.PythonContentEntriesConfigurable" />
   </component>
   <component name="RunManager" selected="Python.sent_frost">
     <configuration name="Inference" type="PythonConfigurationType" factoryName="Python" temporary="true">
@@ -184,7 +184,8 @@
       <workItem from="1697574450083" duration="528000" />
       <workItem from="1698794120833" duration="72575000" />
       <workItem from="1699541952820" duration="1015000" />
-      <workItem from="1699542982005" duration="65000" />
+      <workItem from="1699542982005" duration="460000" />
+      <workItem from="1699543449680" duration="61000" />
     </task>
     <servers />
   </component>
