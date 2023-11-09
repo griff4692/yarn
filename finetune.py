@@ -306,8 +306,7 @@ if __name__ == "__main__":
     args.add_argument(
         "--guidance", default="none",
         choices=[
-            "none", "decorate", "frost", "frost_plan", "clique", "clique_unlike", "clique_frost", "sent_frost",
-            "sent_frost_unlike"
+            "none", "decorate", "frost", "frost_plan", "sent_frost", "sent_frost_unlike"
         ]
     )
     args.add_argument("--dataset", type=str,
